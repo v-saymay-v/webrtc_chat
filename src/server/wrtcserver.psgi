@@ -1,0 +1,95 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use AnyEvent::Handle;
+use Protocol::WebSocket::Handshake::Server;
+use Protocol::WebSocket::Frame;
+use JSON;
+use Digest::MD5 'md5_hex';
+use Data::Dumper;
+
+#my %member;
+
+my $psgi_app = sub {
+
+	my $env = shift;
+	my $fh = $env->{'psgix.io'} or return [500, [], []];
+	my $hs = Protocol::WebSocket::Handshake::Server->new_from_psgi($env);
+
+print Dumper($fh);
+	$hs->parse($fh) or return [400, [], [$hs->error]];
+
+	my %rooms = ();
+
+	return sub {
+		my $h = AnyEvent::Handle->new(fh => $fh);
+#		my $h = AnyEvent::Handle->new(fh => $fh, connect => ['172.31.0.24', 8282]);
+#		$member{fileno($fh)} = $h;
+
+		$h->push_write($hs->to_string);
+
+		my $frame = Protocol::WebSocket::Frame->new;
+		$h->on_read(sub {
+			$frame->append($_[0]->rbuf);
+			while (my $message = $frame->next) {
+				$message = Protocol::WebSocket::Frame->new($message)->to_bytes;
+				if (substr($message, 1, 1) eq ',') {
+					$message = substr($message, 2);
+				}
+				my $data = from_json($message);
+				$data->{room} = $data->{room} ? $data->{room} : '';
+				my $cmd = {eventName => '', data => {}};
+				if ($data->{ eventName } eq 'join room') {
+					if (!%rooms || !$rooms{$data->{ room }}) {
+						$rooms{$data->{room}} = [];
+					}
+
+					$cmd->{eventName} = 'new peer connected';
+					@{$cmd->{data}->{sockId}} = md5_hex($h . '');
+					foreach my $s ($rooms{$data->{room}}) {
+						$h->push_write(Protocol::WebSocket::Frame->new(to_json($cmd))->to_bytes);
+					}
+
+					my @t = $rooms{$data->{room}};
+					push @t, $h;
+					$rooms{$data->{ room }} = @t;
+
+					my @connections = [];
+					foreach my $s ($rooms{$data->{room}}) {
+						if ($s != $h) {
+							push @connections, md5_hex($s . '');
+						}
+					}
+					$cmd->{eventName} = 'get peers';
+					$cmd->{data} = ();
+					@{$cmd->{data}->{connections}} = @connections;
+					$h->push_write(Protocol::WebSocket::Frame->new(to_json($cmd))->to_bytes);
+				} elsif ($data->{ eventName } eq 'receive ice candidate') {
+				} elsif ($data->{ eventName } eq 'send offer') {
+				} elsif ($data->{ eventName } eq 'send answer') {
+				}
+#				$h->push_write(Protocol::WebSocket::Frame->new(to_json($cmd))->to_bytes) for values %member;
+			}
+		});
+		$h->on_error(sub {
+			 my ($hdl, $fatal, $msg) = @_;
+			 my $cv = AnyEvent->condvar;
+#			 delete $member{fileno($fh)};
+			 $hdl->destroy;
+			 $cv->send;
+			 undef $h;
+		});
+		$h->on_eof(sub {
+			my $cv = AnyEvent->condvar;
+			my ($hdl) = @_;
+#			delete $member{fileno($fh)};
+			$hdl->destroy;
+			$cv->send;
+			undef $h;
+		});
+	};
+};
+
+$psgi_app;

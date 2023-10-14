@@ -1,0 +1,192 @@
+<!doctype html>
+<html>
+<head>
+<script>
+var serverConfig = "STUN 173.194.70.126:19302";
+var createId = function () { return Math.random().toString(16).substr(2); };
+var groupSessionId = location.hash = location.hash.substr(1) || createId();
+var peerSessionId = createId();
+var peers = {};
+var localStream;
+
+var messageChannel = new function () {
+    var count = 0;
+    var _onmessage = null;
+    var sendQueue = [];
+
+    function processSendQueue() {
+        var queueItem;
+        var sendstr = "";
+        var itemCount = sendQueue.length;
+        for (var i = 0; (queueItem = sendQueue[i]); i++)
+            sendstr += queueItem.length + ":" + queueItem + ",";
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", "/ctos/" + groupSessionId + "/" + peerSessionId + "/" + (count++));
+        xhr.setRequestHeader("Content-Type", "text/plain;charset=utf-8");
+        xhr.send(sendstr);
+        xhr.onabort = xhr.onerror = xhr.onreadystatechange = function () {
+            if (xhr.readyState == 4) {
+                var restartDelay = 0;
+                if (xhr.status == 204)
+                    sendQueue.splice(0, itemCount);
+                else
+                    restartDelay = 3000;
+                if (sendQueue.length > 0)
+                    setTimeout(processSendQueue, restartDelay);
+            }
+        };
+    }
+
+    this.postMessage = function (msg) {
+        sendQueue.push(msg);
+        if (sendQueue.length == 1)
+            processSendQueue();
+    };
+
+    function startReceiving() {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", "/stoc/" + groupSessionId + "/" + peerSessionId + "/" + (count++));
+        xhr.send(null);
+        xhr.onreadystatechange = function () {
+            if (xhr.readyState == 4) {
+                if (_onmessage instanceof Function) {
+                    var restartDelay = 50;
+                    if (xhr.status == 200) {
+                        var data = xhr.responseText;
+                        var datalen = data.length;
+                        for (var i = 0; i < datalen; i++) {
+                            var colonPos = data.indexOf(':', i);
+                            if (colonPos == -1)
+                                break;
+                            var len = parseInt(data.substring(i, colonPos));
+                            if (!len)
+                                break;
+                            i = colonPos + len + 1;
+                            if (data.charAt(i) != ',')
+                                break;
+                            _onmessage({"data": data.substring(colonPos + 1, i)});
+                        }
+                    }
+                    else
+                        restartDelay = 3000;
+                    setTimeout(startReceiving, restartDelay);
+                }
+            }
+        };
+    }
+
+    this.__defineSetter__("onmessage", function (f) {
+        var hadOnmessage = _onmessage instanceof Function;
+        _onmessage = f;
+        if (!hadOnmessage && (_onmessage instanceof Function))
+            startReceiving();
+    });
+    this.__defineGetter__("onmessage", function () { return _onmessage; });
+};
+
+window.onload = function () {
+    setTimeout(start, 500);
+};
+
+function start() {
+    var PeerConn =  self.webkitDeprecatedPeerConnection || self.webkitPeerConnection;
+    document.body.innerHTML = "<p>Waiting for others to join.. @" + groupSessionId +
+            "<p>Send this link to the other participants: " + location.href +
+            "<video id=\"me\" autoplay></video>";
+
+    var options = {
+        "audio": "yes please",
+        "video": "ok then",
+        "toString": function () {
+            return "audio, video user";
+        }
+    };
+    navigator.webkitGetUserMedia(options, function (stream) {
+        localStream = stream;
+        for (var pname in peers)
+            if (peers[pname].conn)
+                peers[pname].conn.addStream(localStream);
+    });
+
+    messageChannel.onmessage = function (evt) {
+        var otherPeer;
+        var msg = JSON.parse(evt.data);
+        if (msg.event == "join") {
+            console.log("@" + groupSessionId + " - " + msg.who + " joined.");
+            handleJoin(msg.who);
+        }
+        else if (msg.event == "leave") {
+            console.log("@" + groupSessionId + " - " + msg.who + " left.");
+            handleLeave(msg.who);
+        }
+        else if (msg.event == "message" && (otherPeer = peers[msg.from])) {
+            console.log("@" + groupSessionId + " - " + msg.from + " => " + peerSessionId + " :\n" + msg.data);
+            otherPeer.postMessage(evt.data);
+        }
+    };
+
+    function handleJoin(otherPeerSessionId) {
+        var peer = peers[otherPeerSessionId] = {};
+
+        function createPeerConnection() {
+            peer.conn = new PeerConn(serverConfig, function (signalingMessage) {
+                console.log("@" + groupSessionId + " - " + peerSessionId +
+                    " => " + otherPeerSessionId + " :\n" + signalingMessage);
+                messageChannel.postMessage(JSON.stringify({
+                    "event": "message",
+                    "to": otherPeerSessionId,
+                    "data": signalingMessage
+                }));
+            });
+
+            if (localStream) {
+                var me = document.getElementById("me");
+                me.autoplay = me.controls = true;
+                me.src = webkitURL.createObjectURL(localStream);
+                peer.conn.addStream(localStream);
+            }
+
+            peer.conn.onaddstream = function (evt) {
+                peer.video = document.createElement("video");
+                peer.video.autoplay = peer.video.controls = true;
+                peer.video.style.opacity = "0.9";
+                peer.video.src = webkitURL.createObjectURL(evt.stream);
+                document.body.appendChild(peer.video);
+            };
+
+            peer.conn.onclose = function () {
+//                delete document.body.removeChild(peer.video);
+                delete peers[otherPeerSessionId];
+            };
+        };
+
+        if (otherPeerSessionId > peerSessionId)
+            createPeerConnection();
+
+        peer.postMessage = function (message) {
+            if (!peer.conn)
+                createPeerConnection();
+            peer.conn.processSignalingMessage(JSON.parse(message).data);
+        };
+    }
+
+    function handleLeave(otherPeerSessionId) {
+        var peer = peers[otherPeerSessionId];
+        if (peer && peer.conn && peer.conn.readyState != 3) {
+            peer.conn.close();
+//            delete document.body.removeChild(peer.video);
+            delete peers[otherPeerSessionId];
+        }
+    }
+};
+
+window.onhashchange = function (evt) {
+    // FIXME: dynamically switch session
+    window.location.reload();
+};
+
+</script>
+</head>
+<body>
+</body>
+</html>

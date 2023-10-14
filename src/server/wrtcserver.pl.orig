@@ -1,0 +1,169 @@
+#!/usr/bin/env perl
+
+# $Id: wrtcserver.pl,v 1.2 2002/02/05 17:53:08 68user Exp $
+
+use strict;
+use warnings;
+
+use Socket;     # Socket モジュールを使う
+use IO::Handle;
+use Protocol::WebSocket::Handshake::Server;
+use Protocol::WebSocket::Frame;
+use JSON;
+use Digest::MD5 'md5_hex';
+use Data::Dumper;
+
+my $client_waiting;
+my $port = 8282;
+my @all_sockets;
+my %data_sockets = ();  # 現在有効なデータコネクション用のハッシュテーブル
+my %hand_shakes = ();
+my $client_num = 0;     # クライアントの通し番号
+
+# ソケット生成
+socket($client_waiting, PF_INET, SOCK_STREAM, 0)
+	|| die "ソケットを生成できません。$!";
+
+# ソケットオプション設定
+setsockopt($client_waiting, SOL_SOCKET, SO_REUSEADDR, 1)
+	|| die "setsockopt に失敗しました。$!";
+
+# ソケットにアドレス(＝名前)を割り付ける
+bind($client_waiting, pack_sockaddr_in($port, INADDR_ANY))
+	|| die "bind に失敗しました。$!";
+
+# ポートを見張る
+listen($client_waiting, SOMAXCONN)
+	|| die "listen: $!";
+
+push @all_sockets, $client_waiting;
+
+print "ポート $port を見張ります。\n";
+
+my $rout;
+my $rin = &set_bits(@all_sockets);  # ビット列を生成
+
+while (1){
+	printf("before \$rout=%s,\$rin=%s fileno=%d\n", &to_bin($rout), &to_bin($rin), fileno($client_waiting));
+	my $ret = select($rout=$rin, undef, undef, undef);
+	printf("after \$ret=$ret \$rout=%s,\$rin=%s fileno=%d\n", &to_bin($rout), &to_bin($rin), fileno($client_waiting));
+
+	if ( vec($rout, fileno($client_waiting), 1) ){   # 新たにクライアントがやってきた
+
+		# ソケット名は毎回違う名前にする
+		my $new_socket;	# = "CLIENT_$client_num";
+		my $sockaddr = accept($new_socket, $client_waiting);
+
+		# ホスト名、IPアドレス、クライアントのポート番号を取得
+		my ($client_port, $client_iaddr) = unpack_sockaddr_in($sockaddr);
+		my $client_hostname = gethostbyaddr($client_iaddr, AF_INET);
+		my $client_ip = inet_ntoa($client_iaddr);
+
+		print "接続: $client_hostname ($client_ip) ポート $client_port\n";
+		print "ソケット $new_socket を生成します。\n";
+
+		# クライアントに対してバッファリングしない
+		select($new_socket); $|=1; select(STDOUT);
+
+		# 接続中のクライアントをテーブルに登録
+		$data_sockets{$new_socket} = 1;
+		$hand_shakes{$new_socket} = Protocol::WebSocket::Handshake::Server->new;
+
+		# select に渡すビット列を更新
+		push @all_sockets, $new_socket;
+		$rin = &set_bits(@all_sockets);
+		$client_num++;
+
+	} elsif ( $ret ){ # 接続中のクライアントから、データが送信されてきた
+
+#		foreach my $sock ( sort keys %data_sockets ){  # どのクライアントかを一つずつ確かめる
+		foreach my $sock ( sort @all_sockets ){  # どのクライアントかを一つずつ確かめる
+			print "  check... $sock\n";
+			if ( $ret = vec($rout, fileno($sock), 1) ){
+				if ($data_sockets{$sock} == 1) {
+					my $hs = $hand_shakes{$sock};
+					if (!$hs->parse(IO::Handle->new_from_fd(defined(fileno($sock)),'r'))) {
+						&error_out($sock, 400, $hs->error);
+					} else {
+print $hs->to_string;
+						print $sock $hs->to_string;
+						$data_sockets{$sock} = 2;
+					}
+				} else {
+					if( my $line = <$sock> ) {
+print "$line";
+						chomp($line);
+					}
+				}
+#				} else {							# エラー発生＝コネクション切断
+#					print "    コネクション切断 $sock\n";
+#					close($sock);					# ファイルハンドルを close
+#					delete $data_sockets{$sock};	# テーブルから削除
+													# select に渡すビット列を更新
+#					$rin = &set_bits(CLIENT_WAITING, keys %data_sockets);
+#				}
+			}
+		}
+	}
+}
+
+#----------------------------------------------------
+# 1個以上のファイルハンドルを受け取り、fileno で各ファイルハンドルの
+# ディスクリプタ番号を調べ、それに対応するビットを立てたデータを返す。
+# 例えば
+#   fileno(CLIENT_WAITING)==3
+#   fileno(CLIENT_1)      ==4
+#   fileno(CLIENT_3)      ==6
+# のとき、
+#   &set_bits(CLIENT_WAITING, CLIENT_1, CLIENT_3)
+# は
+#   01011000
+# というデータを返す。
+
+sub set_bits {
+	my @sockets = @_;
+
+	print "select に渡すビット列 \$rin を生成します。\n";
+	my $rin="";
+	foreach my $sock (@sockets){
+		# $rin の、右から数えて fileno($sock) 番目のビットを1にする。
+		vec($rin, fileno($sock), 1)=1;
+		printf("  fileno($sock) は %d なので \$rin は %s になります。\n",
+			fileno($sock),
+			&to_bin($rin),
+		);
+	}
+	return $rin;
+}
+
+#----------------------------------------------------
+# 引数を受け取り、2進数の文字列(010111...)に変換して返す。
+
+sub to_bin {
+	return unpack "B*", $_[0];
+}
+
+sub error_out {
+	my $content =
+		"<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\r\n" .
+		"<html><head>\r\n" .
+		"<title>$_[1] Not Found</title>\r\n" .
+		"</head><body>\r\n" .
+		"<h1>Not Found</h1>\r\n" .
+		"<p>$_[2]</p>\r\n" .
+		"</body></html>\r\n";
+	my $len = length($content);
+	my $header =
+		"HTTP/1.1 $_[1] Not Found\r\n" .
+		"Date: Mon, 21 Jan 2013 01:52:56 GMT\r\n" .
+		"Server: webrtc_chat.pl\r\n" .
+		"Content-Length: $len\r\n" .
+		"Connection: close\r\n" .
+		"Content-Type: text/html; charset=iso-8859-1\r\n" .
+		"\r\n" .
+		"$content";
+
+	my $sock = $header . $content;
+}
+
+__END__

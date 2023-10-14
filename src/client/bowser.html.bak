@@ -1,0 +1,134 @@
+<!doctype html>
+<html>
+<head>
+<script>
+var serverConfig = "STUN 173.194.70.126:19302";
+var createId = function () { return Math.random().toString(16).substr(2); };
+var groupSessionId = location.hash = location.hash.substr(1) || 'room';	// createId();
+var peers = {};
+var localStream;
+var ws;
+
+window.onload = function () {
+	setTimeout(start, 500);
+};
+
+function start() {
+	var localAdded = false;
+	var PeerConn =  self.webkitDeprecatedPeerConnection || self.webkitPeerConnection;
+	document.body.innerHTML = "<p>Waiting for others to join.. @" + groupSessionId +
+			"<p>Send this link to the other participants: " + location.href +
+			"<video id=\"me\" autoplay></video>";
+
+	var options = {
+		"audio": "yes please",
+		"video": "ok then",
+		"toString": function () {
+			return "audio, video user";
+		}
+	};
+	navigator.webkitGetUserMedia(options, function (stream) {
+		localStream = stream;
+		for (var pname in peers) {
+			if (peers[pname].conn) {
+				peers[pname].conn.addStream(localStream);
+			}
+		}
+	});
+
+	if (typeof WebSocket === 'undefined') {
+		ws = new MozWebSocket("ws://" + location.host + ":8282/webrtc");
+	} else {
+		ws = new WebSocket("ws://" + location.host + ":8282/webrtc");
+	}
+
+	ws.onopen =  function (e) {
+		var json = JSON.stringify({eventName: 'join room', data: {'room': groupSessionId}});
+		ws.send(json);
+	};
+
+	ws.onmessage = function (evt) {
+		var otherPeer;
+		var msg = JSON.parse(evt.data);
+		if (msg.eventName == "new peer connected") {
+			handleJoin(msg.data.socketId);
+		} else if (msg.eventName == "remove peer connected") {
+			handleLeave(msg.data.socketId);
+		} else if (msg.eventName == "get peers") {
+			for (var s in msg.data.connections) {
+				handleJoin(msg.data.connections[s]);
+			}
+		} else if ((msg.eventName == "receive offer" || msg.eventName == "receive answer") && (otherPeer = peers[msg.socketId])) {
+			otherPeer.postMessage(evt.data);
+		}
+	};
+
+	function handleJoin(otherPeerSessionId) {
+		var peer = peers[otherPeerSessionId] = {};
+
+		function createPeerConnection() {
+			peer.conn = new PeerConn(serverConfig, function (signalingMessage) {
+				var json = JSON.stringify({
+					eventName: "send offer",
+					data: {
+						socketId: otherPeerSessionId+'',
+						room: groupSessionId+'',
+						sdp: signalingMessage.replace('SDP\n{','sdp:{')
+					}
+				});
+				ws.send(json);
+			});
+
+			if (localStream) {
+				if (!localAdded) {
+					var me = document.getElementById("me");
+					me.autoplay = me.controls = true;
+					me.src = webkitURL.createObjectURL(localStream);
+					localAdded = true;
+				}
+				peer.conn.addStream(localStream);
+			}
+
+			peer.conn.onaddstream = function (evt) {
+				peer.video = document.createElement("video");
+				peer.video.autoplay = peer.video.controls = true;
+				peer.video.style.opacity = "0.9";
+				peer.video.src = webkitURL.createObjectURL(evt.stream);
+				document.body.appendChild(peer.video);
+			};
+
+			peer.conn.onclose = function () {
+				delete document.body.removeChild(peer.video);
+				delete peers[otherPeerSessionId];
+			};
+		};
+
+		createPeerConnection();
+
+		peer.postMessage = function (message) {
+			if (!peer.conn)
+				createPeerConnection();
+			peer.conn.processSignalingMessage(JSON.parse(message).data.data);
+		};
+	}
+
+	function handleLeave(otherPeerSessionId) {
+		var peer = peers[otherPeerSessionId];
+		if (peer && peer.conn && peer.conn.readyState != 3) {
+			peer.conn.close();
+			delete document.body.removeChild(peer.video);
+			delete peers[otherPeerSessionId];
+		}
+	}
+};
+
+window.onhashchange = function (evt) {
+	// FIXME: dynamically switch session
+	window.location.reload();
+};
+
+</script>
+</head>
+<body>
+</body>
+</html>

@@ -1,0 +1,4 @@
+#include "include/rapidjson/document.h"
+
+using namespace rapidjson;
+
